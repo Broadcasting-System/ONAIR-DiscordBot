@@ -174,6 +174,8 @@ def gather_status() -> dict:
             by_url[u.rsplit("/", 1)[-1]] = f.get("fileName")
 
     active = (api_get("/speakers/status") or {}).get("active_devices", []) or []
+    _order = {n: i for i, n in enumerate(load_devices()["names"])}
+    active = sorted(active, key=lambda n: _order.get(n, 10 ** 6))  # 매트릭스(교실) 순서대로 정렬
     health = api_get("/display/health") or {}
     matrix_ok = (health.get("matrix") or {}).get("connected")
     live = [c for c, v in (health.get("channels", {}) or {}).items() if v.get("live")]
@@ -273,6 +275,51 @@ async def bell_cmd(interaction: discord.Interaction):
     grp = sched.get("activeGroupId")
     head = f"시보 목록 ({len(jobs)}개)" + (f" · 활성그룹 {grp}" if grp else "")
     await interaction.followup.send(f"{head}\n```\n" + "\n".join(lines)[:1850] + "\n```")
+
+
+async def group_autocomplete(interaction: discord.Interaction, current: str):
+    """시보 그룹 검색 자동완성 (그룹번호 + 종 개수)."""
+    data = ((await asyncio.to_thread(api_get, "/time")) or {}).get("data") or {}
+    q = _norm(current)
+    out = []
+    for gid, v in sorted(data.items()):
+        nbells = sum(len(s.get("bells", [])) for s in v.get("schedules", []))
+        label = f"그룹 {gid} — 종 {nbells}개" + (" · 특별" if v.get("isSpecialActive") else "")
+        if not q or q in _norm(label):
+            out.append(app_commands.Choice(name=label[:100], value=gid))
+        if len(out) >= 25:
+            break
+    return out
+
+
+@tree.command(name="시보그룹", description="송출할 시보 그룹(활성 그룹) 변경 (부장 이상)")
+@app_commands.describe(그룹="활성으로 만들 시보 그룹", 특별="특별(P) 모드 (기본: 유지)")
+@app_commands.autocomplete(그룹=group_autocomplete)
+@app_commands.choices(특별=[
+    app_commands.Choice(name="유지", value="keep"),
+    app_commands.Choice(name="켜기", value="on"),
+    app_commands.Choice(name="끄기", value="off"),
+])
+async def bell_group_cmd(interaction: discord.Interaction, 그룹: str,
+                         특별: app_commands.Choice[str] = None):
+    if not await guard(interaction, "부장"):
+        return
+    await interaction.response.defer(thinking=True)
+    data = ((await asyncio.to_thread(api_get, "/time")) or {}).get("data") or {}
+    if 그룹 not in data:
+        await interaction.followup.send(f"시보 그룹 '{그룹}'을(를) 찾지 못했어요.")
+        return
+    cur_special = bool(data[그룹].get("isSpecialActive"))
+    sp = 특별.value if 특별 else "keep"
+    active = cur_special if sp == "keep" else (sp == "on")
+    # /time/special 은 해당 그룹을 활성으로 만들고 특별모드도 설정한다(=활성 그룹 전환에 사용)
+    code, _ = await asyncio.to_thread(api_post, "/time/special", {"groupId": int(그룹), "active": active})
+    if code == 200:
+        nbells = sum(len(s.get("bells", [])) for s in data[그룹].get("schedules", []))
+        await interaction.followup.send(
+            f"시보 활성 그룹: {그룹} (종 {nbells}개, 특별모드 {'켜짐' if active else '꺼짐'})")
+    else:
+        await interaction.followup.send(f"시보 그룹 변경 실패 (HTTP {code})")
 
 
 async def media_autocomplete(interaction: discord.Interaction, current: str):
@@ -590,10 +637,10 @@ async def on_ready():
         await tree.sync(guild=discord.Object(id=guild.id))
         log.info(f"슬래시 명령 동기화 완료 (guild={guild.name})")
     if GROQ_API_KEY:
-        log.info(f"🤖 ChatOps 활성화 (#{CHATOPS_CHANNEL}, 모델={GROQ_MODEL})")
+        log.info(f"ChatOps 활성화 (#{CHATOPS_CHANNEL}, 모델={GROQ_MODEL})")
     else:
-        log.info("🤖 ChatOps 비활성 (GROQ_API_KEY 없음 → 슬래시 명령만)")
-    log.info(f"✅ 봇 로그인: {client.user}")
+        log.info("ChatOps 비활성 (GROQ_API_KEY 없음 → 슬래시 명령만)")
+    log.info(f"봇 로그인: {client.user}")
 
 
 if __name__ == "__main__":
