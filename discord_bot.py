@@ -221,6 +221,10 @@ CHATOPS_TOOLS = [
 
 TOOL_TIER = {"control_speaker": "부장", "broadcast_tts": "부장", "get_status": "부원"}
 
+# 봇의 '실행 결과/상태' 메시지 접두어. 이런 메시지는 대화 문맥에서 제외한다
+# (그 안의 스피커 이름·상태값이 다음 명령의 대상으로 잘못 새는 것을 방지. 되묻는 질문은 평문이라 유지됨).
+_RESULT_PREFIXES = ("📊", "✅", "❌", "⛔", "🔊", "🔇", "🔴", "⚠️", "🎥", "🖥️", "⏰")
+
 
 def build_system_prompt() -> str:
     d = load_devices()
@@ -339,12 +343,16 @@ async def on_message(message: discord.Message):
         await message.channel.send("⛔ ChatOps는 **부원** 이상만 사용할 수 있어요.")
         return
 
-    # 되물음 연속성을 위해 최근 대화 몇 개를 문맥으로 포함(시간순, user로 시작).
+    # 되물음 연속성을 위해 최근 대화를 문맥으로 포함(시간순, user로 시작).
+    # 단, 봇의 실행결과/상태 메시지는 제외 — 그 안의 스피커 이름 등이 다음 명령을 오염시키지 않도록.
     convo = []
     async for m in message.channel.history(limit=8):
         c = (m.content or "").strip()
-        if c:
-            convo.append({"role": "assistant" if m.author.bot else "user", "content": c})
+        if not c:
+            continue
+        if m.author.bot and c.startswith(_RESULT_PREFIXES):
+            continue
+        convo.append({"role": "assistant" if m.author.bot else "user", "content": c})
     convo.reverse()
     while convo and convo[0]["role"] == "assistant":
         convo.pop(0)
