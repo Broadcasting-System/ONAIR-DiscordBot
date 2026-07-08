@@ -7,8 +7,10 @@
 """
 import os
 import json
+import time
 import asyncio
 import logging
+import unicodedata
 import requests
 import discord
 from discord import app_commands
@@ -94,46 +96,129 @@ async def guard(interaction: discord.Interaction, min_tier: str) -> bool:
     return True
 
 
+# ---------------- 공용: 파일 캐시 / 상태 요약 ----------------
+_MEDIA_TYPE_KO = {"video": "영상", "image": "이미지", "presentation": "PPT", "audio": "오디오"}
+_files_cache = {"ts": 0.0, "data": []}
+_default_banner = {"payload": None}  # 마지막으로 본 기본(default) 현수막 payload
+
+
+def _norm(s: str) -> str:
+    """검색 비교용 정규화. 한글 NFD(맥 파일명)/NFC 차이를 흡수하도록 NFC로 통일 + 소문자."""
+    return unicodedata.normalize("NFC", s or "").lower()
+
+
+async def get_files_cached(ttl: float = 5.0) -> list:
+    """업로드 파일 목록(자동완성용). 짧은 TTL 캐시로 키 입력마다 서버를 때리지 않게."""
+    now = time.time()
+    if ttl <= 0 or now - _files_cache["ts"] > ttl or not _files_cache["data"]:
+        _files_cache["data"] = (await asyncio.to_thread(api_get, "/files/")) or []
+        _files_cache["ts"] = now
+    return _files_cache["data"]
+
+
+def _name_from_id(fid: str) -> str:
+    """파일 id에서 표시용 이름. file_<hash>_<name> → <name>."""
+    if not fid:
+        return "?"
+    if fid.startswith("file_"):
+        parts = fid.split("_", 2)
+        return parts[2] if len(parts) >= 3 else fid
+    if fid.startswith("presentation_"):
+        return "프레젠테이션"
+    return fid
+
+
+def _display_label(st: dict, by_id: dict) -> str:
+    """한 채널의 현재 송출 내용을 사람이 읽을 문자열로."""
+    t = st.get("type", "standby")
+    if t in ("video", "image", "presentation", "audio"):
+        fid = st.get("fileId", "")
+        return by_id.get(fid) or _name_from_id(fid)
+    if t == "youtube":
+        return f"유튜브 {st.get('videoId', '')}"
+    if t == "screen":
+        return "화면 공유"
+    if t == "timer":
+        return "타이머"
+    return t
+
+
+def _banner_label(bstate: dict, by_url: dict) -> str:
+    scene = bstate.get("scene", "blank")
+    payload = bstate.get("payload") or {}
+    if scene == "blank":
+        return "빈 화면 (없음)"
+    if scene == "default":
+        main = payload.get("mainText")
+        return f"기본 배너 ({main})" if main else "기본 배너"
+    if scene in ("image", "gif"):
+        url = payload.get("url", "") or ""
+        name = by_url.get(url) or by_url.get(url.rsplit("/", 1)[-1]) or _name_from_id(url.rsplit("/", 1)[-1])
+        return f"{'이미지' if scene == 'image' else 'GIF'}: {name}"
+    if scene == "scoreboard":
+        return "스코어보드"
+    if scene == "timer":
+        return "타이머"
+    return scene
+
+
+def gather_status() -> dict:
+    """스피커·송출(파일명)·현수막·시보(그룹)·매트릭스를 한 번에. 블로킹."""
+    files = api_get("/files/") or []
+    by_id = {f.get("id"): f.get("fileName") for f in files}
+    by_url = {}
+    for f in files:
+        u = f.get("fileUrl") or ""
+        if u:
+            by_url[u] = f.get("fileName")
+            by_url[u.rsplit("/", 1)[-1]] = f.get("fileName")
+
+    active = (api_get("/speakers/status") or {}).get("active_devices", []) or []
+    health = api_get("/display/health") or {}
+    matrix_ok = (health.get("matrix") or {}).get("connected")
+    live = [c for c, v in (health.get("channels", {}) or {}).items() if v.get("live")]
+
+    sending = []
+    for n in range(1, 6):
+        st = api_get(f"/display/status?channel={n}") if n > 1 else api_get("/display/status")
+        st = st or {}
+        if st.get("type", "standby") not in (None, "", "standby"):
+            sending.append(f"CH{n}: {_display_label(st, by_id)}")
+
+    bstate = api_get("/banner/state") or {}
+    if bstate.get("scene") == "default" and bstate.get("payload"):
+        _default_banner["payload"] = bstate["payload"]  # 기본 payload 캐시(복원용)
+
+    sched = api_get("/time/scheduler") or {}
+    jobs = sched.get("jobs", []) or []
+    grp = sched.get("activeGroupId")
+
+    return {
+        "speakers": ", ".join(active) if active else "모두 꺼짐",
+        "sending": sending,
+        "banner": _banner_label(bstate, by_url),
+        "scheduler": (f"그룹 {grp} · {len(jobs)}개 예약" if grp else f"활성 그룹 없음 · {len(jobs)}개 예약"),
+        "live": [f"CH{c}" for c in live],
+        "matrix": "정상 연결" if matrix_ok else "연결 끊김",
+    }
+
+
 # ---------------- 슬래시 명령 ----------------
 @tree.command(name="상태", description="ONAIR 전체 상태 조회 (스피커·송출·현수막·시보·매트릭스)")
 async def status_cmd(interaction: discord.Interaction):
     if not await guard(interaction, "부원"):
         return
     await interaction.response.defer(thinking=True)
-
-    sp = api_get("/speakers/status") or {}
-    active = sp.get("active_devices", []) or []
-    health = api_get("/display/health") or {}
-    channels = health.get("channels", {}) or {}
-    matrix = health.get("matrix", {}) or {}
-
-    media = []
-    for n in range(1, 6):
-        st = api_get(f"/display/status?channel={n}") if n > 1 else api_get("/display/status")
-        t = (st or {}).get("type", "standby")
-        if t and t != "standby":
-            media.append(f"CH{n}: {t}")
-
-    banner = api_get("/banner/state") or {}
-    scene = banner.get("scene", "blank")
-    sched = api_get("/time/scheduler") or {}
-    bells = sched.get("jobs", []) or []
-    active_group = sched.get("activeGroupId")
-
-    live_ch = [c for c, v in channels.items() if v.get("live")]
-
+    s = await asyncio.to_thread(gather_status)
     embed = discord.Embed(title="ONAIR 상태", color=0x3498DB)
-    embed.add_field(name="켜진 스피커",
-                    value=(", ".join(active) if active else "모두 꺼짐")[:1000], inline=False)
-    embed.add_field(name="송출 중", value=("\n".join(media) if media else "없음"), inline=True)
-    embed.add_field(name="현수막", value=scene, inline=True)
-    embed.add_field(name="시보",
-                    value=f"{len(bells)}개 예약" + (f" (그룹 {active_group})" if active_group else ""), inline=True)
-    embed.add_field(name="송출화면",
-                    value=(f"라이브: {', '.join('CH'+c for c in live_ch)}" if live_ch else "연결된 화면 없음"),
-                    inline=False)
-    embed.add_field(name="스피커 매트릭스",
-                    value=("정상 연결" if matrix.get("connected") else "연결 끊김"), inline=True)
+    embed.add_field(name="스피커", value=s["speakers"][:1000], inline=False)
+    embed.add_field(name="송출 중",
+                    value=("\n".join(s["sending"]) if s["sending"] else "없음"), inline=False)
+    embed.add_field(name="현수막", value=s["banner"][:1000], inline=False)
+    embed.add_field(name="시보", value=s["scheduler"], inline=True)
+    embed.add_field(name="매트릭스", value=s["matrix"], inline=True)
+    if s["live"]:
+        embed.add_field(name="연결된 송출화면", value=", ".join(s["live"]), inline=True)
     await interaction.followup.send(embed=embed)
 
 
@@ -190,121 +275,97 @@ async def bell_cmd(interaction: discord.Interaction):
     await interaction.followup.send(f"{head}\n```\n" + "\n".join(lines)[:1850] + "\n```")
 
 
-_MEDIA_TYPE_KO = {"video": "영상", "image": "이미지", "presentation": "PPT"}
+async def media_autocomplete(interaction: discord.Interaction, current: str):
+    """파일 이름으로 검색되는 자동완성 (매칭 상위 25개)."""
+    q = _norm(current)
+    out = []
+    for f in await get_files_cached():
+        if f.get("type") not in ("video", "image", "presentation"):
+            continue
+        name = f.get("fileName") or f.get("id") or "?"
+        if q and q not in _norm(name):
+            continue
+        fid = f.get("id") or ""
+        if len(fid) > 100:
+            continue
+        out.append(app_commands.Choice(
+            name=f"{name} · {_MEDIA_TYPE_KO.get(f.get('type'), f.get('type'))}"[:100], value=fid))
+        if len(out) >= 25:
+            break
+    return out
 
 
-class MediaSelect(discord.ui.Select):
-    """업로드된 미디어 파일 드롭다운 → 선택 시 해당 채널로 송출."""
-    def __init__(self, files: list, channel: int):
-        self._files = files
-        self._channel = channel
-        options = [
-            discord.SelectOption(
-                label=(f.get("fileName") or f.get("id") or "?")[:100],
-                value=str(i),
-                description=_MEDIA_TYPE_KO.get(f.get("type"), f.get("type")),
-            )
-            for i, f in enumerate(files[:25])
-        ]
-        super().__init__(placeholder="송출할 파일 선택...", min_values=1, max_values=1, options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        if user_tier(interaction.user) < TIER_ORDER["부장"]:
-            await interaction.response.send_message("권한이 부족합니다. 부장 이상 역할이 필요해요.", ephemeral=True)
-            return
-        await interaction.response.defer()
-        f = self._files[int(self.values[0])]
-        payload = {
-            "type": f.get("type"), "fileId": f.get("id"),
-            "url": f.get("fileUrl"), "hlsUrl": f.get("hlsUrl"), "urls": f.get("urls"),
-        }
-        code, _ = await asyncio.to_thread(api_post, f"/display/show?channel={self._channel}", payload)
-        name = f.get("fileName") or f.get("id")
-        await interaction.followup.send(
-            f"송출: {name} (채널 {self._channel})" if code == 200 else f"송출 실패 (HTTP {code})")
-
-
-class MediaView(discord.ui.View):
-    def __init__(self, files: list, channel: int):
-        super().__init__(timeout=120)
-        self.add_item(MediaSelect(files, channel))
-
-
-@tree.command(name="미디어", description="업로드된 파일을 골라 송출 (부장 이상)")
-@app_commands.describe(채널="송출 채널 1~5 (기본 1)")
-async def media_cmd(interaction: discord.Interaction, 채널: int = 1):
+@tree.command(name="미디어", description="업로드된 파일을 검색해 송출 (부장 이상)")
+@app_commands.describe(파일="파일 이름 검색", 채널="송출 채널 1~5 (기본 1)")
+@app_commands.autocomplete(파일=media_autocomplete)
+async def media_cmd(interaction: discord.Interaction, 파일: str, 채널: int = 1):
     if not await guard(interaction, "부장"):
         return
     if not 1 <= 채널 <= 5:
         await interaction.response.send_message("채널은 1~5 사이여야 해요.", ephemeral=True)
         return
     await interaction.response.defer()
-    files = (await asyncio.to_thread(api_get, "/files/")) or []
-    media = [f for f in files if f.get("type") in ("video", "image", "presentation")]
-    if not media:
-        await interaction.followup.send("송출할 파일이 없습니다.")
+    f = next((x for x in await get_files_cached(ttl=0) if x.get("id") == 파일), None)
+    if not f:
+        await interaction.followup.send("파일을 찾지 못했어요. 이름을 입력하고 목록에서 골라줘요.")
         return
-    await interaction.followup.send(f"송출할 파일을 선택하세요 (채널 {채널})", view=MediaView(media, 채널))
+    payload = {"type": f.get("type"), "fileId": f.get("id"),
+               "url": f.get("fileUrl"), "hlsUrl": f.get("hlsUrl"), "urls": f.get("urls")}
+    code, _ = await asyncio.to_thread(api_post, f"/display/show?channel={채널}", payload)
+    name = f.get("fileName") or f.get("id")
+    await interaction.followup.send(
+        f"송출: {name} (채널 {채널})" if code == 200 else f"송출 실패 (HTTP {code})")
 
 
-# 마지막으로 확인한 기본(default) 현수막 payload 캐시 — '기본' 복원 옵션용
-_default_banner = {"payload": None}
+async def banner_autocomplete(interaction: discord.Interaction, current: str):
+    """빈화면/기본 + 업로드 이미지 검색 자동완성."""
+    q = _norm(current)
+    out = []
+    for label, val in (("빈 화면 (끄기)", "__clear__"), ("기본 배너", "__default__")):
+        if not q or q in _norm(label):
+            out.append(app_commands.Choice(name=label, value=val))
+    for f in await get_files_cached():
+        if f.get("type") != "image":
+            continue
+        name = f.get("fileName") or f.get("id") or "?"
+        if q and q not in _norm(name):
+            continue
+        fid = f.get("id") or ""
+        if len(fid) > 100:
+            continue
+        out.append(app_commands.Choice(name=f"이미지: {name}"[:100], value=fid))
+        if len(out) >= 25:
+            break
+    return out
 
 
-class BannerSelect(discord.ui.Select):
-    """빈화면/기본/업로드 이미지 드롭다운 → 현수막 변경."""
-    def __init__(self, images: list):
-        self._images = images
-        options = [discord.SelectOption(label="빈 화면 (끄기)", value="__clear__", description="현수막을 끕니다")]
-        if _default_banner["payload"] is not None:
-            options.append(discord.SelectOption(label="기본 배너", value="__default__", description="기본 현수막으로"))
-        options += [
-            discord.SelectOption(label=(f.get("fileName") or f.get("id") or "?")[:100], value=str(i), description="이미지")
-            for i, f in enumerate(images[:23])
-        ]
-        super().__init__(placeholder="현수막 선택...", min_values=1, max_values=1, options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        if user_tier(interaction.user) < TIER_ORDER["부장"]:
-            await interaction.response.send_message("권한이 부족합니다. 부장 이상 역할이 필요해요.", ephemeral=True)
-            return
-        await interaction.response.defer()
-        v = self.values[0]
-        if v == "__clear__":
-            code, _ = await asyncio.to_thread(api_post, "/banner/clear", None)
-            msg = "현수막 끔 (빈 화면)"
-        elif v == "__default__":
-            code, _ = await asyncio.to_thread(
-                api_post, "/banner/update", {"scene": "default", "payload": _default_banner["payload"] or {}})
-            msg = "기본 배너로 전환"
-        else:
-            f = self._images[int(v)]
-            code, _ = await asyncio.to_thread(
-                api_post, "/banner/update", {"scene": "image", "payload": {"url": f.get("fileUrl"), "fit": "cover"}})
-            msg = f"현수막: {f.get('fileName') or f.get('id')}"
-        await interaction.followup.send(msg if code == 200 else f"현수막 변경 실패 (HTTP {code})")
-
-
-class BannerView(discord.ui.View):
-    def __init__(self, images: list):
-        super().__init__(timeout=120)
-        self.add_item(BannerSelect(images))
-
-
-@tree.command(name="현수막", description="현수막을 업로드 이미지/기본/빈화면으로 변경 (부장 이상)")
-async def banner_cmd(interaction: discord.Interaction):
+@tree.command(name="현수막", description="현수막 변경: 빈화면/기본/업로드 이미지 검색 (부장 이상)")
+@app_commands.describe(대상="빈화면 / 기본 / 이미지 이름 검색")
+@app_commands.autocomplete(대상=banner_autocomplete)
+async def banner_cmd(interaction: discord.Interaction, 대상: str):
     if not await guard(interaction, "부장"):
         return
     await interaction.response.defer()
-    state = (await asyncio.to_thread(api_get, "/banner/state")) or {}
-    if state.get("scene") == "default" and state.get("payload"):
-        _default_banner["payload"] = state.get("payload")
-    files = (await asyncio.to_thread(api_get, "/files/")) or []
-    images = [f for f in files if f.get("type") == "image"]
-    if not images and _default_banner["payload"] is None:
-        await interaction.followup.send("업로드된 이미지가 없습니다.")
-        return
-    await interaction.followup.send("현수막을 선택하세요", view=BannerView(images))
+    if 대상 == "__clear__":
+        code, _ = await asyncio.to_thread(api_post, "/banner/clear", None)
+        msg = "현수막 끔 (빈 화면)"
+    elif 대상 == "__default__":
+        if _default_banner["payload"] is None:
+            st = (await asyncio.to_thread(api_get, "/banner/state")) or {}
+            if st.get("scene") == "default" and st.get("payload"):
+                _default_banner["payload"] = st["payload"]
+        code, _ = await asyncio.to_thread(
+            api_post, "/banner/update", {"scene": "default", "payload": _default_banner["payload"] or {}})
+        msg = "기본 배너로 전환"
+    else:
+        f = next((x for x in await get_files_cached(ttl=0) if x.get("id") == 대상), None)
+        if not f:
+            await interaction.followup.send("이미지를 찾지 못했어요. 이름을 입력하고 목록에서 골라줘요.")
+            return
+        code, _ = await asyncio.to_thread(
+            api_post, "/banner/update", {"scene": "image", "payload": {"url": f.get("fileUrl"), "fit": "cover"}})
+        msg = f"현수막: {f.get('fileName') or f.get('id')}"
+    await interaction.followup.send(msg if code == 200 else f"현수막 변경 실패 (HTTP {code})")
 
 
 # ---------------- ChatOps (#chatops, 자연어 LLM) ----------------
@@ -394,18 +455,15 @@ def groq_chat(messages: list) -> dict:
 
 
 def _chatops_status() -> str:
-    """get_status 도구용 짧은 상태 요약(텍스트)."""
-    active = (api_get("/speakers/status") or {}).get("active_devices", []) or []
-    health = api_get("/display/health") or {}
-    matrix = (health.get("matrix") or {}).get("connected")
-    live = [c for c, v in (health.get("channels", {}) or {}).items() if v.get("live")]
-    banner = (api_get("/banner/state") or {}).get("scene", "blank")
-    bells = len((api_get("/time/scheduler") or {}).get("jobs", []) or [])
-    return "ONAIR 상태\n" + "\n".join([
-        f"켜진 스피커: {', '.join(active) if active else '없음'}",
-        f"현수막: {banner}  ·  시보 예약: {bells}개",
-        f"송출화면: {('CH' + ', CH'.join(live)) if live else '없음'}",
-        f"매트릭스: {'정상' if matrix else '끊김'}",
+    """get_status 도구용 상태 요약(텍스트, 이모지 없음)."""
+    s = gather_status()
+    return "\n".join([
+        "ONAIR 상태",
+        f"스피커: {s['speakers']}",
+        f"송출 중: {'; '.join(s['sending']) if s['sending'] else '없음'}",
+        f"현수막: {s['banner']}",
+        f"시보: {s['scheduler']}",
+        f"매트릭스: {s['matrix']}",
     ])
 
 
