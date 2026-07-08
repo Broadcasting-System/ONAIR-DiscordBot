@@ -521,11 +521,16 @@ CHATOPS_TOOLS = [
         "description": "등록된 시보(예약) 목록을 요일·시간·이름·대상까지 자세히 조회한다.",
         "parameters": {"type": "object", "properties": {}},
     }},
+    {"type": "function", "function": {
+        "name": "show_images",
+        "description": "지금 송출 중인 이미지(현수막 이미지, 채널에 띄운 이미지)를 디코에 사진으로 보여준다.",
+        "parameters": {"type": "object", "properties": {}},
+    }},
 ]
 
 TOOL_TIER = {
     "control_speaker": "부장", "broadcast_tts": "부장",
-    "get_status": "부원", "get_schedule": "부원",
+    "get_status": "부원", "get_schedule": "부원", "show_images": "부원",
 }
 
 
@@ -547,6 +552,7 @@ def build_system_prompt() -> str:
         "[실행]\n"
         "- 대상과 동작(켜기/끄기)이 모두 확정되면 곧바로 도구를 호출한다.\n"
         "- 조회 요청에 '시보'라는 단어가 들어가면(시보 현황/목록/예약/스케줄/일정/몇 시에 등) 반드시 get_schedule을 호출한다. 이때 get_status는 쓰지 않는다.\n"
+        "- '사진/이미지/미리보기 보여줘', '지금 송출/현수막 이미지 보여줘'처럼 이미지를 보여달라면 show_images를 호출한다.\n"
         "- 그 외 전반적인 상태/현황(스피커·송출·현수막 등)은 get_status를 호출한다.\n"
         "간결한 한국어로 답한다."
     )
@@ -579,8 +585,8 @@ def _chatops_status() -> str:
     ])
 
 
-def run_tool(name: str, args: dict, tier: int) -> str:
-    """도구 실행(권한 확인 포함). 블로킹(스레드에서 호출)."""
+def run_tool(name: str, args: dict, tier: int):
+    """도구 실행(권한 확인 포함). 문자열 또는 {'text','images'} 반환. 블로킹."""
     need = TOOL_TIER.get(name, "관리자")
     if tier < TIER_ORDER[need]:
         return f"권한 부족 — 이 작업은 {need} 이상이 필요해요."
@@ -612,25 +618,39 @@ def run_tool(name: str, args: dict, tier: int) -> str:
     if name == "get_schedule":
         return format_schedule()
 
+    if name == "show_images":
+        imgs = collect_onair_images()
+        if not imgs:
+            return "현재 송출 중인 이미지가 없어요."
+        labels = ", ".join(l for l, _, _ in imgs)
+        return {"text": f"송출 중 이미지: {labels}", "images": [(b, fn) for _, b, fn in imgs]}
+
     return f"알 수 없는 작업: {name}"
 
 
-def handle_chatops(convo: list, tier: int) -> str:
-    """대화(convo=[{role,content}...]) → LLM 판별 → 실행/되물음. 블로킹."""
+def handle_chatops(convo: list, tier: int) -> dict:
+    """대화(convo=[{role,content}...]) → LLM 판별 → 실행/되물음.
+    반환: {"text": str, "images": [(bytes, filename), ...]}. 블로킹."""
     messages = [{"role": "system", "content": build_system_prompt()}] + convo
     msg = groq_chat(messages)
     calls = msg.get("tool_calls") or []
     if not calls:
-        return (msg.get("content") or "무슨 작업을 할까요?").strip()
-    out = []
+        return {"text": (msg.get("content") or "무슨 작업을 할까요?").strip(), "images": []}
+    texts, images = [], []
     for tc in calls:
         fn = tc.get("function", {})
         try:
             args = json.loads(fn.get("arguments") or "{}")
         except Exception:
             args = {}
-        out.append(run_tool(fn.get("name", ""), args, tier))
-    return "\n".join(out)
+        res = run_tool(fn.get("name", ""), args, tier)
+        if isinstance(res, dict):
+            if res.get("text"):
+                texts.append(res["text"])
+            images.extend(res.get("images", []))
+        else:
+            texts.append(res)
+    return {"text": "\n".join(t for t in texts if t), "images": images}
 
 
 @client.event
@@ -664,11 +684,14 @@ async def on_message(message: discord.Message):
 
     try:
         async with message.channel.typing():
-            reply = await asyncio.to_thread(handle_chatops, convo, tier)
+            result = await asyncio.to_thread(handle_chatops, convo, tier)
     except Exception as e:
         log.warning(f"ChatOps 오류: {e}")
-        reply = f"처리 중 오류가 났어요: {e}"
-    await message.channel.send(reply[:1900])
+        result = {"text": f"처리 중 오류가 났어요: {e}", "images": []}
+    text = (result.get("text") or "")[:1900]
+    files = [discord.File(io.BytesIO(b), filename=fn) for (b, fn) in (result.get("images") or [])[:10]]
+    if text or files:
+        await message.channel.send(content=text or None, files=files)
 
 
 # ---------------- 서버 초기 설정 ----------------
