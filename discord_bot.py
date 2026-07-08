@@ -258,23 +258,27 @@ async def speaker_cmd(interaction: discord.Interaction, 대상: str, 동작: app
         await interaction.followup.send(f"스피커 제어 실패 (HTTP {code})")
 
 
-@tree.command(name="시보", description="등록된 시보(예약) 목록 조회")
-async def bell_cmd(interaction: discord.Interaction):
-    if not await guard(interaction, "부원"):
-        return
-    await interaction.response.defer(thinking=True)
+def format_schedule() -> str:
+    """시보(예약) 목록 텍스트. /시보 슬래시와 ChatOps get_schedule 공용. (블로킹)"""
     sched = api_get("/time/scheduler") or {}
     jobs = sched.get("jobs", []) or []
     if not jobs:
-        await interaction.followup.send("등록된 시보가 없습니다.")
-        return
+        return "등록된 시보가 없습니다."
     lines = []
     for j in jobs:
         spk = ", ".join(j.get("speakers", [])) or "-"
         lines.append(f"[{j.get('dayLabel','')}] {j.get('time','')}  {j.get('label','')}  —  {spk}")
     grp = sched.get("activeGroupId")
     head = f"시보 목록 ({len(jobs)}개)" + (f" · 활성그룹 {grp}" if grp else "")
-    await interaction.followup.send(f"{head}\n```\n" + "\n".join(lines)[:1850] + "\n```")
+    return f"{head}\n```\n" + "\n".join(lines)[:1850] + "\n```"
+
+
+@tree.command(name="시보", description="등록된 시보(예약) 목록 조회")
+async def bell_cmd(interaction: discord.Interaction):
+    if not await guard(interaction, "부원"):
+        return
+    await interaction.response.defer(thinking=True)
+    await interaction.followup.send(await asyncio.to_thread(format_schedule))
 
 
 async def group_autocomplete(interaction: discord.Interaction, current: str):
@@ -457,12 +461,20 @@ CHATOPS_TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "get_status",
-        "description": "ONAIR 전체 상태(스피커/송출/현수막/시보/매트릭스)를 조회한다.",
+        "description": "ONAIR 전체 상태(스피커/송출/현수막/시보 요약/매트릭스)를 조회한다.",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+    {"type": "function", "function": {
+        "name": "get_schedule",
+        "description": "등록된 시보(예약) 목록을 요일·시간·이름·대상까지 자세히 조회한다.",
         "parameters": {"type": "object", "properties": {}},
     }},
 ]
 
-TOOL_TIER = {"control_speaker": "부장", "broadcast_tts": "부장", "get_status": "부원"}
+TOOL_TIER = {
+    "control_speaker": "부장", "broadcast_tts": "부장",
+    "get_status": "부원", "get_schedule": "부원",
+}
 
 
 def build_system_prompt() -> str:
@@ -482,7 +494,8 @@ def build_system_prompt() -> str:
         "- 되물을 때는 반드시 물음표(?)로 끝나는 짧은 한 문장으로만 답한다.\n\n"
         "[실행]\n"
         "- 대상과 동작(켜기/끄기)이 모두 확정되면 곧바로 도구를 호출한다.\n"
-        "- 상태/현황 질문은 get_status를 호출한다.\n"
+        "- 조회 요청에 '시보'라는 단어가 들어가면(시보 현황/목록/예약/스케줄/일정/몇 시에 등) 반드시 get_schedule을 호출한다. 이때 get_status는 쓰지 않는다.\n"
+        "- 그 외 전반적인 상태/현황(스피커·송출·현수막 등)은 get_status를 호출한다.\n"
         "간결한 한국어로 답한다."
     )
 
@@ -543,6 +556,9 @@ def run_tool(name: str, args: dict, tier: int) -> str:
 
     if name == "get_status":
         return _chatops_status()
+
+    if name == "get_schedule":
+        return format_schedule()
 
     return f"알 수 없는 작업: {name}"
 
