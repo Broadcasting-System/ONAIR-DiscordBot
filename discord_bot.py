@@ -221,26 +221,45 @@ def _fetch_image(url: str):
         return None
 
 
-def collect_onair_images():
-    """지금 송출 중인 이미지 수집 → [(라벨, 바이트, 파일명), ...]. 블로킹."""
-    out = []
-    bstate = api_get("/banner/state") or {}
-    if bstate.get("scene") in ("image", "gif"):
-        url = (bstate.get("payload") or {}).get("url", "")
-        data = _fetch_image(url)
-        if data:
-            ext = os.path.splitext(urlparse(url).path)[1] or ".png"
-            out.append(("현수막", data, f"banner{ext}"))
-    for n in range(1, 6):
-        st = api_get(f"/display/status?channel={n}") if n > 1 else api_get("/display/status")
-        st = st or {}
-        if st.get("type") == "image":
-            url = st.get("url", "")
+def broadcast_report(scope: str = "전체"):
+    """송출 현황 → {"text": str, "images": [(bytes, filename), ...]}. 블로킹.
+    scope: '미디어'(디스플레이 채널) | '현수막'(배너) | '전체'. 미디어와 현수막은 별개."""
+    files = api_get("/files/") or []
+    by_id = {f.get("id"): f.get("fileName") for f in files}
+    by_url = {}
+    for f in files:
+        u = f.get("fileUrl") or ""
+        if u:
+            by_url[u] = f.get("fileName")
+            by_url[u.rsplit("/", 1)[-1]] = f.get("fileName")
+
+    texts, images = [], []
+    if scope in ("현수막", "전체"):
+        bstate = api_get("/banner/state") or {}
+        texts.append(f"현수막: {_banner_label(bstate, by_url)}")
+        if bstate.get("scene") in ("image", "gif"):
+            url = (bstate.get("payload") or {}).get("url", "")
             data = _fetch_image(url)
             if data:
                 ext = os.path.splitext(urlparse(url).path)[1] or ".png"
-                out.append((f"CH{n}", data, f"ch{n}{ext}"))
-    return out
+                images.append((data, f"banner{ext}"))
+    if scope in ("미디어", "전체"):
+        active = False
+        for n in range(1, 6):
+            st = api_get(f"/display/status?channel={n}") if n > 1 else api_get("/display/status")
+            st = st or {}
+            if st.get("type", "standby") not in (None, "", "standby"):
+                active = True
+                texts.append(f"CH{n}: {_display_label(st, by_id)}")
+                if st.get("type") == "image":
+                    url = st.get("url", "")
+                    data = _fetch_image(url)
+                    if data:
+                        ext = os.path.splitext(urlparse(url).path)[1] or ".png"
+                        images.append((data, f"ch{n}{ext}"))
+        if not active:
+            texts.append("송출 중인 미디어가 없어요.")
+    return {"text": "\n".join(texts), "images": images}
 
 
 # ---------------- 슬래시 명령 ----------------
@@ -296,18 +315,21 @@ async def speaker_cmd(interaction: discord.Interaction, 대상: str, 동작: app
         await interaction.followup.send(f"스피커 제어 실패 (HTTP {code})")
 
 
-@tree.command(name="미리보기", description="지금 송출 중인 이미지(현수막/채널)를 디코에서 보기")
-async def preview_cmd(interaction: discord.Interaction):
+@tree.command(name="미리보기", description="지금 송출 중인 화면(미디어/현수막)을 디코에서 보기")
+@app_commands.describe(대상="미리볼 대상 (기본: 전체)")
+@app_commands.choices(대상=[
+    app_commands.Choice(name="전체", value="전체"),
+    app_commands.Choice(name="미디어", value="미디어"),
+    app_commands.Choice(name="현수막", value="현수막"),
+])
+async def preview_cmd(interaction: discord.Interaction, 대상: app_commands.Choice[str] = None):
     if not await guard(interaction, "부원"):
         return
     await interaction.response.defer(thinking=True)
-    imgs = await asyncio.to_thread(collect_onair_images)
-    if not imgs:
-        await interaction.followup.send("현재 송출 중인 이미지가 없어요.")
-        return
-    files = [discord.File(io.BytesIO(data), filename=fn) for (_, data, fn) in imgs[:10]]
-    labels = ", ".join(lbl for (lbl, _, _) in imgs[:10])
-    await interaction.followup.send(f"송출 중 이미지: {labels}", files=files)
+    scope = 대상.value if 대상 else "전체"
+    r = await asyncio.to_thread(broadcast_report, scope)
+    files = [discord.File(io.BytesIO(b), filename=fn) for (b, fn) in r["images"][:10]]
+    await interaction.followup.send(content=(r["text"] or "송출 중인 것이 없어요.")[:1900], files=files)
 
 
 def format_schedule() -> str:
@@ -522,15 +544,18 @@ CHATOPS_TOOLS = [
         "parameters": {"type": "object", "properties": {}},
     }},
     {"type": "function", "function": {
-        "name": "show_images",
-        "description": "지금 송출 중인 이미지(현수막 이미지, 채널에 띄운 이미지)를 디코에 사진으로 보여준다.",
-        "parameters": {"type": "object", "properties": {}},
+        "name": "show_broadcast",
+        "description": "지금 송출 중인 화면을 보여준다(이미지면 사진 첨부). 미디어(디스플레이 채널 송출)와 현수막(배너)은 서로 별개다.",
+        "parameters": {"type": "object", "properties": {
+            "대상": {"type": "string", "enum": ["미디어", "현수막", "전체"],
+                    "description": "미디어=디스플레이 채널 송출, 현수막=배너. 애매하면 전체."},
+        }, "required": ["대상"]},
     }},
 ]
 
 TOOL_TIER = {
     "control_speaker": "부장", "broadcast_tts": "부장",
-    "get_status": "부원", "get_schedule": "부원", "show_images": "부원",
+    "get_status": "부원", "get_schedule": "부원", "show_broadcast": "부원",
 }
 
 
@@ -552,8 +577,8 @@ def build_system_prompt() -> str:
         "[실행]\n"
         "- 대상과 동작(켜기/끄기)이 모두 확정되면 곧바로 도구를 호출한다.\n"
         "- 조회 요청에 '시보'라는 단어가 들어가면(시보 현황/목록/예약/스케줄/일정/몇 시에 등) 반드시 get_schedule을 호출한다. 이때 get_status는 쓰지 않는다.\n"
-        "- '사진/이미지/미리보기 보여줘', '지금 송출/현수막 이미지 보여줘'처럼 이미지를 보여달라면 show_images를 호출한다.\n"
-        "- 그 외 전반적인 상태/현황(스피커·송출·현수막 등)은 get_status를 호출한다.\n"
+        "- 송출 화면/사진을 보여달라거나 '뭐 송출중이야'처럼 지금 송출을 물으면 show_broadcast. 미디어(디스플레이 채널) 질문이면 대상='미디어', 현수막/배너 질문이면 대상='현수막', 막연하면 대상='전체'. 미디어와 현수막은 서로 다르니 섞지 말 것.\n"
+        "- 그 외 전반 상태(스피커·시보·매트릭스 포함 요약)를 물으면 get_status를 호출한다.\n"
         "간결한 한국어로 답한다."
     )
 
@@ -618,12 +643,11 @@ def run_tool(name: str, args: dict, tier: int):
     if name == "get_schedule":
         return format_schedule()
 
-    if name == "show_images":
-        imgs = collect_onair_images()
-        if not imgs:
-            return "현재 송출 중인 이미지가 없어요."
-        labels = ", ".join(l for l, _, _ in imgs)
-        return {"text": f"송출 중 이미지: {labels}", "images": [(b, fn) for _, b, fn in imgs]}
+    if name == "show_broadcast":
+        scope = args.get("대상") or "전체"
+        if scope not in ("미디어", "현수막", "전체"):
+            scope = "전체"
+        return broadcast_report(scope)
 
     return f"알 수 없는 작업: {name}"
 
@@ -696,15 +720,21 @@ async def on_message(message: discord.Message):
 
 # ---------------- 서버 초기 설정 ----------------
 async def ensure_roles(guild: discord.Guild):
-    existing = {r.name for r in guild.roles}
+    existing = {r.name: r for r in guild.roles}
     for name in TIER_ROLES + COHORT_ROLES:
-        if name not in existing:
-            try:
-                await guild.create_role(name=name, colour=ROLE_COLORS.get(name, discord.Color.default()),
-                                        mentionable=True, reason="ONAIR 봇 초기 역할 생성")
-                log.info(f"역할 생성: {name}")
-            except Exception as e:
-                log.warning(f"역할 생성 실패 {name}: {e}")
+        hoist = name in COHORT_ROLES  # 기수(4/5/6기)는 멤버 목록에서 분리 표시(hoist)
+        colour = ROLE_COLORS.get(name, discord.Color.default())
+        role = existing.get(name)
+        try:
+            if role is None:
+                await guild.create_role(name=name, colour=colour, mentionable=True,
+                                        hoist=hoist, reason="ONAIR 봇 초기 역할 생성")
+                log.info(f"역할 생성: {name} (hoist={hoist})")
+            elif role.hoist != hoist:
+                await role.edit(hoist=hoist, reason="기수 역할 멤버목록 분리 표시")
+                log.info(f"역할 hoist 갱신: {name} → {hoist}")
+        except Exception as e:
+            log.warning(f"역할 처리 실패 {name}: {e}")
 
 
 async def lock_alert_channel(guild: discord.Guild):
