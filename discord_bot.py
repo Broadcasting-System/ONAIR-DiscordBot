@@ -7,6 +7,7 @@
 """
 import os
 import io
+import re
 import json
 import time
 import asyncio
@@ -206,6 +207,18 @@ def gather_status() -> dict:
         "live": [f"CH{c}" for c in live],
         "matrix": "정상 연결" if matrix_ok else "연결 끊김",
     }
+
+
+_YT_RE = re.compile(r"(?:youtu\.be/|[?&]v=|/embed/|/shorts/|/live/|/v/)([\w-]{11})")
+
+
+def extract_youtube_id(text: str):
+    """유튜브 URL(watch/youtu.be/shorts/embed) 또는 11자 ID에서 videoId 추출. 없으면 None."""
+    text = (text or "").strip()
+    if re.fullmatch(r"[\w-]{11}", text):
+        return text
+    m = _YT_RE.search(text)
+    return m.group(1) if m else None
 
 
 def _fetch_image(url: str):
@@ -442,6 +455,31 @@ async def media_cmd(interaction: discord.Interaction, 파일: str, 채널: int =
         f"송출: {name} (채널 {채널})" if code == 200 else f"송출 실패 (HTTP {code})")
 
 
+@tree.command(name="유튜브", description="유튜브 링크/ID를 미디어로 송출 (부장 이상)")
+@app_commands.describe(링크="유튜브 URL 또는 영상 ID", 채널="송출 채널 1~5 (기본 1)", 반복="반복 재생")
+@app_commands.choices(반복=[
+    app_commands.Choice(name="끄기", value="off"),
+    app_commands.Choice(name="켜기", value="on"),
+])
+async def youtube_cmd(interaction: discord.Interaction, 링크: str, 채널: int = 1,
+                      반복: app_commands.Choice[str] = None):
+    if not await guard(interaction, "부장"):
+        return
+    if not 1 <= 채널 <= 5:
+        await interaction.response.send_message("채널은 1~5 사이여야 해요.", ephemeral=True)
+        return
+    vid = extract_youtube_id(링크)
+    if not vid:
+        await interaction.response.send_message("유효한 유튜브 링크/ID를 못 찾았어요.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    loop = bool(반복 and 반복.value == "on")
+    code, _ = await asyncio.to_thread(api_post, f"/display/youtube?channel={채널}", {"videoId": vid, "loop": loop})
+    await interaction.followup.send(
+        f"유튜브 송출 · youtu.be/{vid} (채널 {채널}{', 반복' if loop else ''})"
+        if code == 200 else f"유튜브 송출 실패 (HTTP {code})")
+
+
 async def banner_autocomplete(interaction: discord.Interaction, current: str):
     """빈화면/기본 + 업로드 이미지 검색 자동완성."""
     q = _norm(current)
@@ -534,6 +572,14 @@ CHATOPS_TOOLS = [
         }, "required": ["text", "targets"]},
     }},
     {"type": "function", "function": {
+        "name": "play_youtube",
+        "description": "유튜브 링크(또는 11자 영상 ID)를 미디어로 송출(재생)한다.",
+        "parameters": {"type": "object", "properties": {
+            "링크": {"type": "string", "description": "유튜브 URL 또는 영상 ID"},
+            "채널": {"type": "integer", "description": "송출 채널 1~5 (기본 1)"},
+        }, "required": ["링크"]},
+    }},
+    {"type": "function", "function": {
         "name": "get_status",
         "description": "ONAIR 전체 상태(스피커/송출/현수막/시보 요약/매트릭스)를 조회한다.",
         "parameters": {"type": "object", "properties": {}},
@@ -554,7 +600,7 @@ CHATOPS_TOOLS = [
 ]
 
 TOOL_TIER = {
-    "control_speaker": "부장", "broadcast_tts": "부장",
+    "control_speaker": "부장", "broadcast_tts": "부장", "play_youtube": "부장",
     "get_status": "부원", "get_schedule": "부원", "show_broadcast": "부원",
 }
 
@@ -576,6 +622,7 @@ def build_system_prompt() -> str:
         "- 되물을 때는 반드시 물음표(?)로 끝나는 짧은 한 문장으로만 답한다.\n\n"
         "[실행]\n"
         "- 대상과 동작(켜기/끄기)이 모두 확정되면 곧바로 도구를 호출한다.\n"
+        "- '유튜브 ~ 틀어줘/송출/재생'처럼 유튜브 링크나 영상 ID가 있으면 play_youtube를 호출한다(링크를 그대로 넘긴다).\n"
         "- 조회 요청에 '시보'라는 단어가 들어가면(시보 현황/목록/예약/스케줄/일정/몇 시에 등) 반드시 get_schedule을 호출한다. 이때 get_status는 쓰지 않는다.\n"
         "- 송출 화면/사진을 보여달라거나 '뭐 송출중이야'처럼 지금 송출을 물으면 show_broadcast. 미디어(디스플레이 채널) 질문이면 대상='미디어', 현수막/배너 질문이면 대상='현수막', 막연하면 대상='전체'. 미디어와 현수막은 서로 다르니 섞지 말 것.\n"
         "- 그 외 전반 상태(스피커·시보·매트릭스 포함 요약)를 물으면 get_status를 호출한다.\n"
@@ -636,6 +683,18 @@ def run_tool(name: str, args: dict, tier: int):
         if code == 200:
             return f"TTS 송출 · 대상 {', '.join(targets)}\n> {text}"
         return f"송출 실패 (HTTP {code})"
+
+    if name == "play_youtube":
+        vid = extract_youtube_id(args.get("링크") or "")
+        if not vid:
+            return "유효한 유튜브 링크를 못 찾았어요."
+        try:
+            ch = int(args.get("채널") or 1)
+        except Exception:
+            ch = 1
+        ch = ch if 1 <= ch <= 5 else 1
+        code, _ = api_post(f"/display/youtube?channel={ch}", {"videoId": vid, "loop": False})
+        return f"유튜브 송출 · youtu.be/{vid} (채널 {ch})" if code == 200 else f"유튜브 송출 실패 (HTTP {code})"
 
     if name == "get_status":
         return _chatops_status()
