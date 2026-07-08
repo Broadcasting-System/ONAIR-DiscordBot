@@ -6,11 +6,13 @@
 - ONAIR 서버와 같은 머신(=tailnet 안)에서 실행 → 127.0.0.1:8000 API에 직접 접근, Discord로는 아웃바운드.
 """
 import os
+import io
 import json
 import time
 import asyncio
 import logging
 import unicodedata
+from urllib.parse import urlparse
 import requests
 import discord
 from discord import app_commands
@@ -33,6 +35,7 @@ _load_env(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
 GUILD_ID = int(os.environ.get("DISCORD_GUILD_ID", "0") or 0)
 API = os.environ.get("ONAIR_API", "http://127.0.0.1:8000/api").rstrip("/")
+ONAIR_BASE = API[:-4] if API.endswith("/api") else API  # http://127.0.0.1:8000 (이미지 fetch용)
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
@@ -205,6 +208,41 @@ def gather_status() -> dict:
     }
 
 
+def _fetch_image(url: str):
+    """ONAIR 서버에서 이미지 바이트를 가져온다(봇=tailnet 안). 저장된 host는 무시하고 경로만 사용."""
+    try:
+        path = urlparse(url).path if "://" in (url or "") else (url or "")
+        if not path:
+            return None
+        r = requests.get(ONAIR_BASE + path, timeout=10)
+        return r.content if r.ok else None
+    except Exception as e:
+        log.warning(f"이미지 fetch 실패: {e}")
+        return None
+
+
+def collect_onair_images():
+    """지금 송출 중인 이미지 수집 → [(라벨, 바이트, 파일명), ...]. 블로킹."""
+    out = []
+    bstate = api_get("/banner/state") or {}
+    if bstate.get("scene") in ("image", "gif"):
+        url = (bstate.get("payload") or {}).get("url", "")
+        data = _fetch_image(url)
+        if data:
+            ext = os.path.splitext(urlparse(url).path)[1] or ".png"
+            out.append(("현수막", data, f"banner{ext}"))
+    for n in range(1, 6):
+        st = api_get(f"/display/status?channel={n}") if n > 1 else api_get("/display/status")
+        st = st or {}
+        if st.get("type") == "image":
+            url = st.get("url", "")
+            data = _fetch_image(url)
+            if data:
+                ext = os.path.splitext(urlparse(url).path)[1] or ".png"
+                out.append((f"CH{n}", data, f"ch{n}{ext}"))
+    return out
+
+
 # ---------------- 슬래시 명령 ----------------
 @tree.command(name="상태", description="ONAIR 전체 상태 조회 (스피커·송출·현수막·시보·매트릭스)")
 async def status_cmd(interaction: discord.Interaction):
@@ -256,6 +294,20 @@ async def speaker_cmd(interaction: discord.Interaction, 대상: str, 동작: app
         await interaction.followup.send(f"스피커 {동작.name} · 대상: {', '.join(targets)}")
     else:
         await interaction.followup.send(f"스피커 제어 실패 (HTTP {code})")
+
+
+@tree.command(name="미리보기", description="지금 송출 중인 이미지(현수막/채널)를 디코에서 보기")
+async def preview_cmd(interaction: discord.Interaction):
+    if not await guard(interaction, "부원"):
+        return
+    await interaction.response.defer(thinking=True)
+    imgs = await asyncio.to_thread(collect_onair_images)
+    if not imgs:
+        await interaction.followup.send("현재 송출 중인 이미지가 없어요.")
+        return
+    files = [discord.File(io.BytesIO(data), filename=fn) for (_, data, fn) in imgs[:10]]
+    labels = ", ".join(lbl for (lbl, _, _) in imgs[:10])
+    await interaction.followup.send(f"송출 중 이미지: {labels}", files=files)
 
 
 def format_schedule() -> str:
