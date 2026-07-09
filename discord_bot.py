@@ -10,6 +10,7 @@ import io
 import re
 import json
 import time
+import base64
 import asyncio
 import logging
 import unicodedata
@@ -40,6 +41,8 @@ ONAIR_BASE = API[:-4] if API.endswith("/api") else API  # http://127.0.0.1:8000 
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
+# 이미지 첨부가 있을 때만 쓰는 비전 모델(이미지 입력 + 도구호출 지원). 텍스트만이면 위 빠른 모델 유지.
+GROQ_VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "qwen/qwen3.6-27b").strip()
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 CMD_CHANNEL = "명령"
@@ -232,6 +235,29 @@ def _fetch_image(url: str):
     except Exception as e:
         log.warning(f"이미지 fetch 실패: {e}")
         return None
+
+
+def _attachment_data_url(url: str, content_type: str | None):
+    """디스코드 첨부 이미지(URL) → base64 data URL. 비전 모델 입력용. (블로킹)
+    디스코드 CDN URL은 만료/서명 이슈가 있어 바이트를 받아 base64로 임베드한다."""
+    try:
+        r = requests.get(url, timeout=15)
+        if not r.ok:
+            return None
+        ctype = content_type or "image/png"
+        b64 = base64.b64encode(r.content).decode()
+        return f"data:{ctype};base64,{b64}"
+    except Exception as e:
+        log.warning(f"첨부 이미지 다운로드 실패: {e}")
+        return None
+
+
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_think(text: str) -> str:
+    """일부 모델(qwen 등)이 답변 앞에 붙이는 <think>...</think> 추론 블록 제거."""
+    return _THINK_RE.sub("", text or "").strip()
 
 
 def broadcast_report(scope: str = "전체"):
@@ -626,18 +652,22 @@ def build_system_prompt() -> str:
         "- 조회 요청에 '시보'라는 단어가 들어가면(시보 현황/목록/예약/스케줄/일정/몇 시에 등) 반드시 get_schedule을 호출한다. 이때 get_status는 쓰지 않는다.\n"
         "- 송출 화면/사진을 보여달라거나 '뭐 송출중이야'처럼 지금 송출을 물으면 show_broadcast. 미디어(디스플레이 채널) 질문이면 대상='미디어', 현수막/배너 질문이면 대상='현수막', 막연하면 대상='전체'. 미디어와 현수막은 서로 다르니 섞지 말 것.\n"
         "- 그 외 전반 상태(스피커·시보·매트릭스 포함 요약)를 물으면 get_status를 호출한다.\n"
+        "[이미지]\n"
+        "- 이미지가 첨부되면 그 내용을 읽어 한국어로 설명하거나 질문에 답한다.\n"
+        "- 시간표 이미지로 시보를 자동 등록하는 기능은 아직 없다. 요청받으면 지금은 내용만 읽어줄 수 있다고 답하고, 표에서 읽은 시간/교시를 정리해 준다.\n"
         "간결한 한국어로 답한다."
     )
 
 
-def groq_chat(messages: list) -> dict:
-    """Groq chat completions 호출 → assistant 메시지(dict) 반환. (블로킹)"""
+def groq_chat(messages: list, model: str | None = None, timeout: int = 30) -> dict:
+    """Groq chat completions 호출 → assistant 메시지(dict) 반환. (블로킹)
+    model 미지정 시 기본(텍스트) 모델. 이미지 첨부 시 비전 모델을 넘긴다."""
     r = requests.post(
         GROQ_URL,
         headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-        json={"model": GROQ_MODEL, "messages": messages, "tools": CHATOPS_TOOLS,
+        json={"model": model or GROQ_MODEL, "messages": messages, "tools": CHATOPS_TOOLS,
               "tool_choice": "auto", "temperature": 0.1},
-        timeout=30,
+        timeout=timeout,
     )
     if not r.ok:
         raise RuntimeError(f"Groq {r.status_code}: {r.text[:200]}")
@@ -711,14 +741,31 @@ def run_tool(name: str, args: dict, tier: int):
     return f"알 수 없는 작업: {name}"
 
 
-def handle_chatops(convo: list, tier: int) -> dict:
+def handle_chatops(convo: list, tier: int, image_urls: list | None = None) -> dict:
     """대화(convo=[{role,content}...]) → LLM 판별 → 실행/되물음.
+    image_urls가 있으면 마지막 user 메시지에 이미지를 붙여 비전 모델로 처리.
     반환: {"text": str, "images": [(bytes, filename), ...]}. 블로킹."""
     messages = [{"role": "system", "content": build_system_prompt()}] + convo
-    msg = groq_chat(messages)
+    use_vision = bool(image_urls)
+    if use_vision:
+        # 마지막 user 메시지 content를 멀티모달(text + image_url 리스트)로 변환
+        for m in reversed(messages):
+            if m["role"] == "user":
+                txt = m["content"] if isinstance(m["content"], str) else ""
+                parts = ([{"type": "text", "text": txt}] if txt else []) + [
+                    {"type": "image_url", "image_url": {"url": u}} for u in image_urls
+                ]
+                m["content"] = parts
+                break
+    msg = groq_chat(
+        messages,
+        model=GROQ_VISION_MODEL if use_vision else None,
+        timeout=60 if use_vision else 30,
+    )
     calls = msg.get("tool_calls") or []
     if not calls:
-        return {"text": (msg.get("content") or "무슨 작업을 할까요?").strip(), "images": []}
+        text = _strip_think(msg.get("content") or "") or "무슨 작업을 할까요?"
+        return {"text": text, "images": []}
     texts, images = [], []
     for tc in calls:
         fn = tc.get("function", {})
@@ -743,7 +790,9 @@ async def on_message(message: discord.Message):
     if getattr(message.channel, "name", None) != CHATOPS_CHANNEL:
         return
     content = (message.content or "").strip()
-    if not content:
+    image_atts = [a for a in message.attachments
+                  if (getattr(a, "content_type", "") or "").startswith("image/")]
+    if not content and not image_atts:
         return
     tier = user_tier(message.author)
     if tier < TIER_ORDER["부원"]:
@@ -765,9 +814,26 @@ async def on_message(message: discord.Message):
     while convo and convo[0]["role"] == "assistant":
         convo.pop(0)
 
+    # 이미지 첨부 → 비전 모델 입력 (최대 5장).
+    # 작은 이미지는 base64로 임베드(자체 완결·안정), 큰 이미지/실패는 디스코드 URL을
+    # 그대로 넘겨 Groq가 직접 가져가게 한다(최대 20MB, base64는 ~4MB 제한).
+    image_urls = []
+    for a in image_atts[:5]:
+        size = getattr(a, "size", 0) or 0
+        du = None
+        if 0 < size <= 3_500_000:
+            du = await asyncio.to_thread(
+                _attachment_data_url, a.url, getattr(a, "content_type", None))
+        image_urls.append(du or a.url)
+    # 캡션 없이 이미지만 보낸 경우, 현재 메시지는 convo에 없으니 user 턴을 만들어 준다.
+    if image_urls and not content:
+        convo.append({"role": "user", "content": "첨부한 이미지를 읽어서 내용을 알려줘."})
+    if not convo:
+        return
+
     try:
         async with message.channel.typing():
-            result = await asyncio.to_thread(handle_chatops, convo, tier)
+            result = await asyncio.to_thread(handle_chatops, convo, tier, image_urls)
     except Exception as e:
         log.warning(f"ChatOps 오류: {e}")
         result = {"text": f"처리 중 오류가 났어요: {e}", "images": []}
