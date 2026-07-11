@@ -49,11 +49,14 @@ CMD_CHANNEL = "명령"
 ALERT_CHANNEL = "알림"
 CHATOPS_CHANNEL = "chatops"
 TIER_ROLES = ["관리자", "부장", "부원"]
-COHORT_ROLES = ["4기", "5기", "6기"]
+COHORT_ROLES = ["2기", "3기", "4기", "5기", "6기"]
+GRADUATE_ROLE = "졸업생"  # 이 역할이 있으면 다른 역할과 무관하게 명령어·ChatOps 전면 차단
 TIER_ORDER = {"부원": 0, "부장": 1, "관리자": 2}
 ROLE_COLORS = {
     "관리자": discord.Color.red(), "부장": discord.Color.blue(), "부원": discord.Color.greyple(),
+    "2기": discord.Color.teal(), "3기": discord.Color.gold(),
     "4기": discord.Color.orange(), "5기": discord.Color.green(), "6기": discord.Color.purple(),
+    GRADUATE_ROLE: discord.Color.dark_grey(),
 }
 
 intents = discord.Intents.default()
@@ -87,6 +90,9 @@ def api_post(path: str, json=None):
 # ---------------- 권한 게이팅 ----------------
 def user_tier(member) -> int:
     names = {r.name for r in getattr(member, "roles", [])}
+    # 졸업생은 부원/부장 등 다른 역할이 있어도 명령어·ChatOps 사용 불가(-1)
+    if GRADUATE_ROLE in names:
+        return -1
     return max((TIER_ORDER[n] for n in names if n in TIER_ORDER), default=-1)
 
 
@@ -846,8 +852,9 @@ async def on_message(message: discord.Message):
 # ---------------- 서버 초기 설정 ----------------
 async def ensure_roles(guild: discord.Guild):
     existing = {r.name: r for r in guild.roles}
-    for name in TIER_ROLES + COHORT_ROLES:
-        hoist = name in COHORT_ROLES  # 기수(4/5/6기)는 멤버 목록에서 분리 표시(hoist)
+    for name in TIER_ROLES + COHORT_ROLES + [GRADUATE_ROLE]:
+        # 기수(2~6기)·졸업생은 멤버 목록에서 분리 표시(hoist)
+        hoist = name in COHORT_ROLES or name == GRADUATE_ROLE
         colour = ROLE_COLORS.get(name, discord.Color.default())
         role = existing.get(name)
         try:
