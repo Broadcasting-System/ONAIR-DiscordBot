@@ -1,6 +1,6 @@
 """ONAIR Discord 봇 — #명령(슬래시)과 #chatops(자연어 LLM)로 ONAIR를 제어.
 - 실행 시: 역할 6개 생성(관리자/부장/부원, 4/5/6기) + #알림 읽기전용 + 슬래시 명령 동기화.
-- #명령: 슬래시 명령(/상태·/tts·/스피커).
+- #명령: 슬래시 명령(/상태·/tts·/스피커·/미디어·/유튜브·/현수막·/시보·/씬·/매트릭스 등).
 - #chatops: 자연어 → Groq LLM function calling → 기능/파라미터 판별 → 부족하면 되묻고, 충분하면 실행.
 - 권한: Discord 역할로 게이팅 (관리자·부장=제어, 부원=조회). ONAIR API는 localhost(=admin)로 호출.
 - ONAIR 서버와 같은 머신(=tailnet 안)에서 실행 → 127.0.0.1:8000 API에 직접 접근, Discord로는 아웃바운드.
@@ -215,6 +215,7 @@ def gather_status() -> dict:
         "scheduler": (f"그룹 {grp} · {len(jobs)}개 예약" if grp else f"활성 그룹 없음 · {len(jobs)}개 예약"),
         "live": [f"CH{c}" for c in live],
         "matrix": "정상 연결" if matrix_ok else "연결 끊김",
+        "halls": halls_summary(),
     }
 
 
@@ -307,8 +308,117 @@ def broadcast_report(scope: str = "전체"):
     return {"text": "\n".join(texts), "images": images}
 
 
+# ---------------- 강당·홀 장비 (오디오 믹서 씬 / 영상 매트릭스 프리셋) ----------------
+_halls_cache = {"ts": 0.0, "data": None}
+
+
+def _fail(what: str, code: int, data: dict) -> str:
+    """API 실패 메시지. 서버가 준 한국어 사유(detail)가 있으면 그대로 보여준다."""
+    detail = data.get("detail") if isinstance(data, dict) else None
+    return f"{what} 실패 — {detail}" if isinstance(detail, str) and detail else f"{what} 실패 (HTTP {code})"
+
+
+def load_halls(ttl: float = 60.0) -> list:
+    """공간 목록 + 각 공간의 씬·프리셋 이름. 슬래시 자동완성·ChatOps 접지용 캐시. (블로킹)"""
+    now = time.time()
+    if _halls_cache["data"] is not None and now - _halls_cache["ts"] < ttl:
+        return _halls_cache["data"]
+    halls = []
+    for h in (api_get("/halls") or {}).get("halls", []):
+        item = dict(h, scenes=[], presets=[])
+        if h.get("hasMixer"):
+            mixer = api_get(f"/halls/{h['id']}/mixer") or {}
+            item["scenes"] = mixer.get("scenes") or []
+        if h.get("hasVideoMatrix"):
+            matrix = api_get(f"/halls/{h['id']}/matrix") or {}
+            item["presets"] = matrix.get("presets") or []
+        halls.append(item)
+    _halls_cache.update(ts=now, data=halls)
+    return halls
+
+
+def find_hall(text: str, need: str):
+    """공간 id 또는 이름('강당', '다목적')으로 찾기. need: 'mixer' | 'matrix'. (hall, 오류메시지)"""
+    key = "hasMixer" if need == "mixer" else "hasVideoMatrix"
+    what = "오디오 믹서" if need == "mixer" else "영상 매트릭스"
+    candidates = [h for h in load_halls() if h.get(key)]
+    if not candidates:
+        return None, f"{what}가 설정된 공간이 없어요."
+    q = _norm(text).replace(" ", "")
+    if not q:
+        if len(candidates) == 1:
+            return candidates[0], None
+        return None, f"어느 공간인가요? ({', '.join(h['name'] for h in candidates)})"
+    for h in candidates:
+        if q == _norm(h["id"]) or q == _norm(h["name"]).replace(" ", ""):
+            return h, None
+    partial = [h for h in candidates if q in _norm(h["name"]).replace(" ", "")]
+    if len(partial) == 1:
+        return partial[0], None
+    return None, f"'{text}' 공간을 못 찾았어요. 어느 공간인가요? ({', '.join(h['name'] for h in candidates)})"
+
+
+def find_named(items: list, text: str, number_key: str | None = None):
+    """씬·프리셋을 이름(부분 일치) 또는 번호로 찾기."""
+    q = _norm(str(text)).replace(" ", "")
+    if number_key and q.isdigit():
+        hit = next((x for x in items if str(x.get(number_key)) == q), None)
+        if hit:
+            return hit
+    exact = [x for x in items if _norm(x.get("name", "")).replace(" ", "") == q]
+    if exact:
+        return exact[0]
+    partial = [x for x in items if q and q in _norm(x.get("name", "")).replace(" ", "")]
+    return partial[0] if len(partial) == 1 else None
+
+
+def recall_scene(hall_text: str, scene_text: str) -> str:
+    hall, err = find_hall(hall_text, "mixer")
+    if err:
+        return err
+    scene = find_named(hall["scenes"], scene_text, number_key="pc")
+    if scene is None:
+        names = ", ".join(s["name"] for s in hall["scenes"])
+        return f"{hall['name']} 믹서에서 '{scene_text}' 씬을 못 찾았어요. 어떤 씬인가요? ({names})"
+    code, data = api_post(f"/halls/{hall['id']}/mixer/scene", {"pc": int(scene["pc"])})
+    if code == 200:
+        return f"{hall['name']} 믹서 · '{data.get('scene', scene['name'])}' 씬으로 전환"
+    return _fail("씬 전환", code, data)
+
+
+def apply_video_preset(hall_text: str, preset_text: str) -> str:
+    hall, err = find_hall(hall_text, "matrix")
+    if err:
+        return err
+    preset = find_named(hall["presets"], preset_text)
+    if preset is None:
+        names = ", ".join(p["name"] for p in hall["presets"])
+        return f"{hall['name']} 영상 매트릭스에서 '{preset_text}' 프리셋을 못 찾았어요. 어떤 프리셋인가요? ({names})"
+    code, data = api_post(f"/halls/{hall['id']}/matrix/presets/{preset['id']}/apply")
+    if code == 200:
+        return f"{hall['name']} 영상 · '{data.get('preset', preset['name'])}' 프리셋 적용"
+    return _fail("프리셋 적용", code, data)
+
+
+def halls_summary() -> list:
+    """공간별 믹서 씬·영상 매트릭스 연결 요약 줄들. (블로킹)"""
+    lines = []
+    for h in (api_get("/halls") or {}).get("halls", []):
+        parts = []
+        if h.get("hasMixer"):
+            m = api_get(f"/halls/{h['id']}/mixer") or {}
+            scene = next((s["name"] for s in m.get("scenes", []) if s.get("pc") == m.get("currentScene")), None)
+            parts.append(f"믹서 {scene or '씬 모름'}" + ("" if m.get("connected") else " (연결 끊김)"))
+        if h.get("hasVideoMatrix"):
+            v = api_get(f"/halls/{h['id']}/matrix") or {}
+            parts.append("영상 매트릭스 " + ("정상" if v.get("connected") else "연결 끊김"))
+        if parts:
+            lines.append(f"{h.get('name', h.get('id'))}: {' · '.join(parts)}")
+    return lines
+
+
 # ---------------- 슬래시 명령 ----------------
-@tree.command(name="상태", description="ONAIR 전체 상태 조회 (스피커·송출·현수막·시보·매트릭스)")
+@tree.command(name="상태", description="ONAIR 전체 상태 조회 (스피커·송출·현수막·시보·매트릭스·강당 장비)")
 async def status_cmd(interaction: discord.Interaction):
     if not await guard(interaction, "부원"):
         return
@@ -320,10 +430,64 @@ async def status_cmd(interaction: discord.Interaction):
                     value=("\n".join(s["sending"]) if s["sending"] else "없음"), inline=False)
     embed.add_field(name="현수막", value=s["banner"][:1000], inline=False)
     embed.add_field(name="시보", value=s["scheduler"], inline=True)
-    embed.add_field(name="매트릭스", value=s["matrix"], inline=True)
+    embed.add_field(name="스피커 매트릭스", value=s["matrix"], inline=True)
     if s["live"]:
         embed.add_field(name="연결된 송출화면", value=", ".join(s["live"]), inline=True)
+    if s["halls"]:
+        embed.add_field(name="강당·홀 장비", value="\n".join(s["halls"])[:1000], inline=False)
     await interaction.followup.send(embed=embed)
+
+
+async def _hall_choices(current: str, key: str):
+    halls = await asyncio.to_thread(load_halls)
+    q = _norm(current)
+    return [app_commands.Choice(name=h["name"][:100], value=h["id"])
+            for h in halls if h.get(key) and (not q or q in _norm(h["name"]))][:25]
+
+
+async def mixer_hall_autocomplete(interaction: discord.Interaction, current: str):
+    return await _hall_choices(current, "hasMixer")
+
+
+async def matrix_hall_autocomplete(interaction: discord.Interaction, current: str):
+    return await _hall_choices(current, "hasVideoMatrix")
+
+
+async def scene_autocomplete(interaction: discord.Interaction, current: str):
+    """앞에서 고른 공간의 믹서 씬 목록."""
+    hall, _ = await asyncio.to_thread(find_hall, getattr(interaction.namespace, "공간", "") or "", "mixer")
+    q = _norm(current)
+    scenes = hall["scenes"] if hall else []
+    return [app_commands.Choice(name=f"{s['pc']}. {s['name']}"[:100], value=str(s["pc"]))
+            for s in scenes if not q or q in _norm(f"{s['pc']} {s['name']}")][:25]
+
+
+async def preset_autocomplete(interaction: discord.Interaction, current: str):
+    hall, _ = await asyncio.to_thread(find_hall, getattr(interaction.namespace, "공간", "") or "", "matrix")
+    q = _norm(current)
+    presets = hall["presets"] if hall else []
+    return [app_commands.Choice(name=p["name"][:100], value=p["name"][:100])
+            for p in presets if not q or q in _norm(p["name"])][:25]
+
+
+@tree.command(name="씬", description="강당·홀 오디오 믹서의 저장된 씬 불러오기 (부장 이상)")
+@app_commands.describe(공간="믹서가 있는 공간", 씬="불러올 씬")
+@app_commands.autocomplete(공간=mixer_hall_autocomplete, 씬=scene_autocomplete)
+async def scene_cmd(interaction: discord.Interaction, 공간: str, 씬: str):
+    if not await guard(interaction, "부장"):
+        return
+    await interaction.response.defer(thinking=True)
+    await interaction.followup.send(await asyncio.to_thread(recall_scene, 공간, 씬))
+
+
+@tree.command(name="매트릭스", description="다목적홀 등 HDMI 영상 매트릭스 프리셋 적용 (부장 이상)")
+@app_commands.describe(공간="영상 매트릭스가 있는 공간", 프리셋="적용할 화면 배치")
+@app_commands.autocomplete(공간=matrix_hall_autocomplete, 프리셋=preset_autocomplete)
+async def matrix_cmd(interaction: discord.Interaction, 공간: str, 프리셋: str):
+    if not await guard(interaction, "부장"):
+        return
+    await interaction.response.defer(thinking=True)
+    await interaction.followup.send(await asyncio.to_thread(apply_video_preset, 공간, 프리셋))
 
 
 @tree.command(name="tts", description="TTS 방송 송출 (부장 이상)")
@@ -612,8 +776,24 @@ CHATOPS_TOOLS = [
         }, "required": ["링크"]},
     }},
     {"type": "function", "function": {
+        "name": "recall_mixer_scene",
+        "description": "강당·다목적홀 오디오 믹서(콘솔)에 저장된 씬을 불러온다. 스피커(교실 방송)와는 무관하다.",
+        "parameters": {"type": "object", "properties": {
+            "공간": {"type": "string", "description": "공간 이름 (예: 강당, 다목적홀). 믹서가 한 곳뿐이면 비워도 된다."},
+            "씬": {"type": "string", "description": "씬 이름 또는 번호"},
+        }, "required": ["씬"]},
+    }},
+    {"type": "function", "function": {
+        "name": "apply_video_preset",
+        "description": "HDMI 영상 매트릭스에 저장된 화면 배치(프리셋)를 적용한다. 어떤 입력을 어떤 화면에 띄울지 한 번에 바꾼다.",
+        "parameters": {"type": "object", "properties": {
+            "공간": {"type": "string", "description": "공간 이름 (예: 다목적홀). 매트릭스가 한 곳뿐이면 비워도 된다."},
+            "프리셋": {"type": "string", "description": "프리셋 이름"},
+        }, "required": ["프리셋"]},
+    }},
+    {"type": "function", "function": {
         "name": "get_status",
-        "description": "ONAIR 전체 상태(스피커/송출/현수막/시보 요약/매트릭스)를 조회한다.",
+        "description": "ONAIR 전체 상태(스피커/송출/현수막/시보 요약/매트릭스/강당·홀 장비)를 조회한다.",
         "parameters": {"type": "object", "properties": {}},
     }},
     {"type": "function", "function": {
@@ -633,8 +813,31 @@ CHATOPS_TOOLS = [
 
 TOOL_TIER = {
     "control_speaker": "부장", "broadcast_tts": "부장", "play_youtube": "부장",
+    "recall_mixer_scene": "부장", "apply_video_preset": "부장",
     "get_status": "부원", "get_schedule": "부원", "show_broadcast": "부원",
 }
+
+
+def _halls_prompt() -> str:
+    """강당·홀 장비의 실제 씬·프리셋 이름을 알려 LLM이 없는 이름을 지어내지 않게 한다."""
+    lines = []
+    try:
+        halls = load_halls()
+    except Exception:
+        halls = []
+    for h in halls:
+        if h.get("scenes"):
+            lines.append(f"- {h['name']} 오디오 믹서 씬: {', '.join(s['name'] for s in h['scenes'])}")
+        if h.get("presets"):
+            lines.append(f"- {h['name']} 영상 매트릭스 프리셋: {', '.join(p['name'] for p in h['presets'])}")
+    if not lines:
+        return ""
+    return (
+        "\n[강당·홀 장비] 교실 스피커와는 별개인 공연장 장비다.\n" + "\n".join(lines) + "\n"
+        "- '강당 믹서 행사 씬', '강당 소리 기본으로' 같은 요청은 recall_mixer_scene.\n"
+        "- '다목적홀 화면 카메라로', '프리셋 발표' 같은 요청은 apply_video_preset.\n"
+        "- 목록에 없는 씬·프리셋이면 지어내지 말고 되묻는다.\n"
+    )
 
 
 def build_system_prompt() -> str:
@@ -661,6 +864,7 @@ def build_system_prompt() -> str:
         "[이미지]\n"
         "- 이미지가 첨부되면 그 내용을 읽어 한국어로 설명하거나 질문에 답한다.\n"
         "- 시간표 이미지로 시보를 자동 등록하는 기능은 아직 없다. 요청받으면 지금은 내용만 읽어줄 수 있다고 답하고, 표에서 읽은 시간/교시를 정리해 준다.\n"
+        + _halls_prompt() +
         "간결한 한국어로 답한다."
     )
 
@@ -689,7 +893,8 @@ def _chatops_status() -> str:
         f"송출 중: {'; '.join(s['sending']) if s['sending'] else '없음'}",
         f"현수막: {s['banner']}",
         f"시보: {s['scheduler']}",
-        f"매트릭스: {s['matrix']}",
+        f"스피커 매트릭스: {s['matrix']}",
+        *s["halls"],
     ])
 
 
@@ -731,6 +936,18 @@ def run_tool(name: str, args: dict, tier: int):
         ch = ch if 1 <= ch <= 5 else 1
         code, _ = api_post(f"/display/youtube?channel={ch}", {"videoId": vid, "loop": False})
         return f"유튜브 송출 · youtu.be/{vid} (채널 {ch})" if code == 200 else f"유튜브 송출 실패 (HTTP {code})"
+
+    if name == "recall_mixer_scene":
+        scene = str(args.get("씬") or "").strip()
+        if not scene:
+            return "어떤 씬을 불러올까요?"
+        return recall_scene(str(args.get("공간") or ""), scene)
+
+    if name == "apply_video_preset":
+        preset = str(args.get("프리셋") or "").strip()
+        if not preset:
+            return "어떤 프리셋을 적용할까요?"
+        return apply_video_preset(str(args.get("공간") or ""), preset)
 
     if name == "get_status":
         return _chatops_status()
