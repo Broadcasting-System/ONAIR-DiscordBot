@@ -470,6 +470,21 @@ async def preset_autocomplete(interaction: discord.Interaction, current: str):
             for p in presets if not q or q in _norm(p["name"])][:25]
 
 
+@tree.command(name="절전", description="켜진 교실 스피커·송출 화면을 지금 모두 끄기 (부장 이상)")
+async def energy_cmd(interaction: discord.Interaction):
+    if not await guard(interaction, "부장"):
+        return
+    await interaction.response.defer(thinking=True)
+    code, data = await asyncio.to_thread(api_post, "/energy/run")
+    if code == 200:
+        spk = data.get("speakers") or []
+        screens = ", ".join(f"CH{c}" for c in (data.get("displays") or [])) or "없음"
+        names = f" ({', '.join(spk[:8])}{' 외' if len(spk) > 8 else ''})" if spk else ""
+        await interaction.followup.send(f"절전 완료 · 스피커 {len(spk)}곳{names} · 송출 화면 {screens}")
+    else:
+        await interaction.followup.send(_fail("절전", code, data))
+
+
 @tree.command(name="씬", description="강당·홀 오디오 믹서의 저장된 씬 불러오기 (부장 이상)")
 @app_commands.describe(공간="믹서가 있는 공간", 씬="불러올 씬")
 @app_commands.autocomplete(공간=mixer_hall_autocomplete, 씬=scene_autocomplete)
