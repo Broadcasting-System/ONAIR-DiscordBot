@@ -78,9 +78,14 @@ def api_get(path: str):
         return None
 
 
-def api_post(path: str, json=None):
+# 방송 실행 API 는 소리가 끝날 때까지 응답하지 않는다 — 짧은 시간 초과로 끊으면 실제론 나가는 방송을 '실패'로 알린다
+BROADCAST_TIMEOUT = 240
+TTS_ECHO_MAX = 300
+
+
+def api_post(path: str, json=None, timeout: float = 10):
     try:
-        r = requests.post(f"{API}{path}", json=json, timeout=10)
+        r = requests.post(f"{API}{path}", json=json, timeout=timeout)
         return r.status_code, (r.json() if r.headers.get("content-type", "").startswith("application/json") else {})
     except Exception as e:
         log.warning(f"API POST 실패 {path}: {e}")
@@ -96,8 +101,16 @@ def user_tier(member) -> int:
     return max((TIER_ORDER[n] for n in names if n in TIER_ORDER), default=-1)
 
 
+def in_home_guild(guild) -> bool:
+    """이 학교 서버에서만 — 봇이 다른 서버에 초대돼 같은 이름의 역할·채널을 만들어도 조작할 수 없게."""
+    return guild is not None and (not GUILD_ID or guild.id == GUILD_ID)
+
+
 async def guard(interaction: discord.Interaction, min_tier: str) -> bool:
     """#명령 채널 + 역할 검사. 실패 시 ephemeral 안내 후 False."""
+    if not in_home_guild(interaction.guild):
+        await interaction.response.send_message("이 서버에서는 ONAIR를 조작할 수 없어요.", ephemeral=True)
+        return False
     if getattr(interaction.channel, "name", None) != CMD_CHANNEL:
         await interaction.response.send_message(
             f"이 명령은 **#{CMD_CHANNEL}** 채널에서만 사용할 수 있어요.", ephemeral=True)
@@ -512,13 +525,14 @@ async def tts_cmd(interaction: discord.Interaction, 내용: str, 대상: str = "
         return
     await interaction.response.defer(thinking=True)
     targets = [t.strip() for t in 대상.split(",") if t.strip()]
-    code, _ = api_post("/broadcast/execute", {
+    code, data = await asyncio.to_thread(api_post, "/broadcast/execute", {
         "sourceType": "tts", "sourceId": 내용, "targets": targets, "restoreState": True,
-    })
+    }, BROADCAST_TIMEOUT)
     if code == 200:
-        await interaction.followup.send(f"TTS 송출 완료 · 대상: {', '.join(targets)}\n> {내용}")
+        echo = 내용 if len(내용) <= TTS_ECHO_MAX else 내용[:TTS_ECHO_MAX] + "…"
+        await interaction.followup.send(f"TTS 송출 완료 · 대상: {', '.join(targets)}\n> {echo}")
     else:
-        await interaction.followup.send(f"송출 실패 (HTTP {code})")
+        await interaction.followup.send(_fail("TTS 송출", code, data))
 
 
 @tree.command(name="스피커", description="스피커 ON/OFF (부장 이상)")
@@ -532,11 +546,11 @@ async def speaker_cmd(interaction: discord.Interaction, 대상: str, 동작: app
         return
     await interaction.response.defer(thinking=True)
     targets = [t.strip() for t in 대상.split(",") if t.strip()]
-    code, data = api_post("/speakers/control", {"targets": targets, "action": 동작.value})
+    code, data = await asyncio.to_thread(api_post, "/speakers/control", {"targets": targets, "action": 동작.value})
     if code == 200 and data.get("success", True):
         await interaction.followup.send(f"스피커 {동작.name} · 대상: {', '.join(targets)}")
     else:
-        await interaction.followup.send(f"스피커 제어 실패 (HTTP {code})")
+        await interaction.followup.send(_fail("스피커 제어", code, data))
 
 
 @tree.command(name="미리보기", description="지금 송출 중인 화면(미디어/현수막)을 디코에서 보기")
@@ -615,6 +629,9 @@ async def bell_group_cmd(interaction: discord.Interaction, 그룹: str,
     sp = 특별.value if 특별 else "keep"
     active = cur_special if sp == "keep" else (sp == "on")
     # /time/special 은 해당 그룹을 활성으로 만들고 특별모드도 설정한다(=활성 그룹 전환에 사용)
+    if not str(그룹).isdigit():
+        await interaction.followup.send(f"시보 그룹 번호가 올바르지 않아요: {그룹}")
+        return
     code, _ = await asyncio.to_thread(api_post, "/time/special", {"groupId": int(그룹), "active": active})
     if code == 200:
         nbells = sum(len(s.get("bells", [])) for s in data[그룹].get("schedules", []))
@@ -924,21 +941,23 @@ def run_tool(name: str, args: dict, tier: int):
         action = args.get("action")
         if not targets or action not in ("on", "off"):
             return "대상이나 동작(켜기/끄기)이 불명확해요. 다시 알려줄래요?"
-        code, _ = api_post("/speakers/control", {"targets": targets, "action": action})
+        code, data = api_post("/speakers/control", {"targets": targets, "action": action})
         if code == 200:
             return f"스피커 {'켜기' if action == 'on' else '끄기'} · {', '.join(targets)}"
-        return f"스피커 제어 실패 (HTTP {code})"
+        return _fail("스피커 제어", code, data)
 
     if name == "broadcast_tts":
         text = (args.get("text") or "").strip()
         targets = [t for t in (args.get("targets") or []) if t]
         if not text or not targets:
             return "방송할 내용이나 대상이 빠졌어요."
-        code, _ = api_post("/broadcast/execute", {
-            "sourceType": "tts", "sourceId": text, "targets": targets, "restoreState": True})
+        code, data = api_post("/broadcast/execute", {
+            "sourceType": "tts", "sourceId": text, "targets": targets, "restoreState": True},
+            BROADCAST_TIMEOUT)
         if code == 200:
-            return f"TTS 송출 · 대상 {', '.join(targets)}\n> {text}"
-        return f"송출 실패 (HTTP {code})"
+            echo = text if len(text) <= TTS_ECHO_MAX else text[:TTS_ECHO_MAX] + "…"
+            return f"TTS 송출 · 대상 {', '.join(targets)}\n> {echo}"
+        return _fail("TTS 송출", code, data)
 
     if name == "play_youtube":
         vid = extract_youtube_id(args.get("링크") or "")
@@ -1025,7 +1044,7 @@ def handle_chatops(convo: list, tier: int, image_urls: list | None = None) -> di
 async def on_message(message: discord.Message):
     if message.author.bot or not GROQ_API_KEY:
         return
-    if getattr(message.channel, "name", None) != CHATOPS_CHANNEL:
+    if not in_home_guild(message.guild) or getattr(message.channel, "name", None) != CHATOPS_CHANNEL:
         return
     content = (message.content or "").strip()
     image_atts = [a for a in message.attachments
@@ -1040,15 +1059,21 @@ async def on_message(message: discord.Message):
     # 되물음 연속성을 위해 최근 대화를 문맥으로 포함(시간순, user로 시작).
     # 봇 메시지는 '되묻는 질문'(물음표로 끝남)만 포함 — 실행결과/상태 메시지 속 스피커 이름 등이
     # 다음 명령의 대상으로 새는 것을 방지.
+    # 문맥에는 '이 사람'의 메시지와 이 사람에게 되물은 봇 질문만 넣는다 — 다른 사람(권한 낮은 부원 등)이
+    # 쓴 요청을 권한 높은 사람이 "응"이라고만 답해 대신 실행되는 일을 막는다.
+    recent = [m async for m in message.channel.history(limit=12)]
+    recent.reverse()
     convo = []
-    async for m in message.channel.history(limit=8):
+    last_human = None
+    for m in recent:
         c = (m.content or "").strip()
-        if not c:
-            continue
-        if m.author.bot and not c.endswith("?"):
-            continue
-        convo.append({"role": "assistant" if m.author.bot else "user", "content": c})
-    convo.reverse()
+        if not m.author.bot:
+            last_human = m.author.id
+            if m.author.id == message.author.id and c:
+                convo.append({"role": "user", "content": c})
+        elif c.endswith("?") and last_human == message.author.id:
+            convo.append({"role": "assistant", "content": c})
+    convo = convo[-8:]
     while convo and convo[0]["role"] == "assistant":
         convo.pop(0)
 
