@@ -22,6 +22,15 @@ ONAIR 서버 코드에 의존하지 않고 **HTTP(REST)로만** 통신하므로 
   - 대상 변환: `N학년 M반`→`N-M`, `모두/전교`→`전체`. 유효 이름/그룹 밖은 임의로 만들지 않고 되묻는다.
   - 권한: 조회(get_status)=부원+, 스피커·TTS=부장+. 도구 실행 직전에 역할을 확인.
 
+- **말로 조작** (`ASSIST_ENABLED=1` 일 때, 기본 `#명령` 채널 · 키 필요 없음):
+  - 예) "강당 조회 모드로 바꾸고 사회자 마이크 좀 키워", "1번 마이크 꺼", "다목적홀 조명 전부 꺼", "녹음 시작", "강당 콘솔 연결돼 있어?"
+  - 흐름: 말 → ONAIR 서버 `/api/assist/plan`(Jev 판단 모델, 키 없으면 규칙) → 안전하고 확실하면 바로 실행,
+    위험하거나(전체 음소거·암전·녹음 중지·행사 중 씬 전환) 애매하면 **[실행] [취소]** 버튼 → 실행 결과 답장.
+  - 버튼은 **말한 사람만** 누를 수 있고 **2분** 뒤 사라진다. 설정·관리(주소·권한·삭제 등)는 채팅으로 안 된다.
+  - 권한: 상태 묻기=부원+, 조작=부장+ (서버가 다시 확인). 잡담에는 대답하지 않는다 (봇을 @부르면 대답).
+  - 서버 쪽 설명: `onair-server/docs/assist.md`.
+  - 슬래시 명령·#chatops 는 그대로다. 같은 채널을 둘 다로 쓰면 말로 조작이 먼저다.
+
 > 알림(웹훅) 기능은 봇이 아니라 **ONAIR 서버**(`notification_service`)가 담당한다. 이 저장소는 명령 봇만.
 
 ### ⚠️ ChatOps 켜려면 (2가지)
@@ -29,6 +38,24 @@ ONAIR 서버 코드에 의존하지 않고 **HTTP(REST)로만** 통신하므로 
 2. Discord 개발자 포털 → 앱 → **Bot → Privileged Gateway Intents → "MESSAGE CONTENT INTENT" 켜기**
    (자연어 메시지 본문을 읽으려면 필수. 이걸 안 켜고 키만 넣으면 봇 시작 시 인텐트 오류가 난다.)
    봇이 100개 미만 서버에 있으면 심사 없이 토글만으로 켜진다.
+
+### 말로 조작 켜기
+`.env` 에:
+```env
+ASSIST_ENABLED=1
+ASSIST_CHANNELS=명령            # 쉼표로 여러 채널
+# ONAIR 를 Cloudflare Access 뒤에 둘 때만 (서비스 토큰)
+CF_ACCESS_CLIENT_ID=
+CF_ACCESS_CLIENT_SECRET=
+```
+메시지 본문을 읽어야 해서 ChatOps 와 같은 **MESSAGE CONTENT INTENT** 를 켜야 한다 (위 2번). 안 켜고 `ASSIST_ENABLED=1` 이면 봇 시작 시 인텐트 오류가 난다.
+Jev 키는 봇이 아니라 **ONAIR 서버** `.env` 의 `JEV_API_KEY` 에 넣는다.
+
+### 테스트
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q
+```
 
 ## 설치 & 실행
 

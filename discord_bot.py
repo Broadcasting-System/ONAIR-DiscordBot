@@ -1,6 +1,8 @@
 """ONAIR Discord 봇 — #명령(슬래시)과 #chatops(자연어 LLM)로 ONAIR를 제어.
 - 실행 시: 역할 6개 생성(관리자/부장/부원, 4/5/6기) + #알림 읽기전용 + 슬래시 명령 동기화.
 - #명령: 슬래시 명령(/상태·/tts·/스피커·/미디어·/유튜브·/현수막·/시보·/씬·/매트릭스 등).
+- 말로 조작(ASSIST_ENABLED=1): ASSIST_CHANNELS(기본 #명령)에 쓴 말 → ONAIR /api/assist(Jev·규칙)
+  → 위험하거나 애매하면 [실행] [취소] 버튼(요청한 사람만, 2분) → 실행 결과 답장. (assist_client.py)
 - #chatops: 자연어 → Groq LLM function calling → 기능/파라미터 판별 → 부족하면 되묻고, 충분하면 실행.
 - 권한: Discord 역할로 게이팅 (관리자·부장=제어, 부원=조회). ONAIR API는 localhost(=admin)로 호출.
 - ONAIR 서버와 같은 머신(=tailnet 안)에서 실행 → 127.0.0.1:8000 API에 직접 접근, Discord로는 아웃바운드.
@@ -18,6 +20,8 @@ from urllib.parse import urlparse
 import requests
 import discord
 from discord import app_commands
+
+import assist_client as assist
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("onair-bot")
@@ -52,6 +56,12 @@ TIER_ROLES = ["관리자", "부장", "부원"]
 COHORT_ROLES = ["2기", "3기", "4기", "5기", "6기"]
 GRADUATE_ROLE = "졸업생"  # 이 역할이 있으면 다른 역할과 무관하게 명령어·ChatOps 전면 차단
 TIER_ORDER = {"부원": 0, "부장": 1, "관리자": 2}
+
+# 말로 하는 조작 — 메시지 본문(privileged intent)이 필요해서 켜야만 동작한다 (README 참고)
+ASSIST_ENABLED = assist.env_flag("ASSIST_ENABLED")
+ASSIST_CHANNELS = assist.channel_names(os.environ.get("ASSIST_CHANNELS", CMD_CHANNEL))
+# Cloudflare Access 뒤에 ONAIR 를 둘 때 쓸 서비스 토큰 (없으면 빈 헤더)
+API_HEADERS = assist.api_headers()
 ROLE_COLORS = {
     "관리자": discord.Color.red(), "부장": discord.Color.blue(), "부원": discord.Color.greyple(),
     "2기": discord.Color.teal(), "3기": discord.Color.gold(),
@@ -62,7 +72,7 @@ ROLE_COLORS = {
 intents = discord.Intents.default()
 # #chatops 자연어 처리에는 메시지 본문(privileged intent)이 필요.
 # GROQ 키가 있을 때만 켜서, ChatOps 미사용 시엔 개발자 포털 토글 없이도 봇이 뜬다.
-if GROQ_API_KEY:
+if GROQ_API_KEY or ASSIST_ENABLED:
     intents.message_content = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
@@ -71,7 +81,7 @@ tree = app_commands.CommandTree(client)
 # ---------------- ONAIR API ----------------
 def api_get(path: str):
     try:
-        r = requests.get(f"{API}{path}", timeout=6)
+        r = requests.get(f"{API}{path}", timeout=6, headers=API_HEADERS)
         return r.json() if r.ok else None
     except Exception as e:
         log.warning(f"API GET 실패 {path}: {e}")
@@ -85,7 +95,7 @@ TTS_ECHO_MAX = 300
 
 def api_post(path: str, json=None, timeout: float = 10):
     try:
-        r = requests.post(f"{API}{path}", json=json, timeout=timeout)
+        r = requests.post(f"{API}{path}", json=json, timeout=timeout, headers=API_HEADERS)
         return r.status_code, (r.json() if r.headers.get("content-type", "").startswith("application/json") else {})
     except Exception as e:
         log.warning(f"API POST 실패 {path}: {e}")
@@ -250,7 +260,7 @@ def _fetch_image(url: str):
         path = urlparse(url).path if "://" in (url or "") else (url or "")
         if not path:
             return None
-        r = requests.get(ONAIR_BASE + path, timeout=10)
+        r = requests.get(ONAIR_BASE + path, timeout=10, headers=API_HEADERS)
         return r.content if r.ok else None
     except Exception as e:
         log.warning(f"이미지 fetch 실패: {e}")
@@ -1040,11 +1050,102 @@ def handle_chatops(convo: list, tier: int, image_urls: list | None = None) -> di
     return {"text": "\n".join(t for t in texts if t), "images": images}
 
 
+# ---------------- 말로 하는 조작 (ONAIR /api/assist) ----------------
+class AssistConfirmView(discord.ui.View):
+    """[실행] [취소] — 요청한 사람만, 2분 뒤 사라짐."""
+
+    def __init__(self, plan: dict, requester: dict):
+        super().__init__(timeout=assist.CONFIRM_TIMEOUT_S)
+        self.plan = plan
+        self.requester = requester
+        self.message: discord.Message | None = None
+        self.done = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not assist.can_press(interaction.user.id, self.requester["discordId"]):
+            await interaction.response.send_message("요청한 사람만 누를 수 있어요.", ephemeral=True)
+            return False
+        return True
+
+    async def _close(self, interaction: discord.Interaction, text: str):
+        self.done = True
+        self.stop()
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content=text, view=self)
+
+    @discord.ui.button(label="실행", style=discord.ButtonStyle.danger)
+    async def run(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.done:
+            return
+        self.done = True
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content=assist.format_plan(self.plan) + "\n\n실행 중…", view=self)
+        code, data = await asyncio.to_thread(
+            assist.execute, API, self.plan["planId"], self.requester, API_HEADERS)
+        text = assist.format_results(data, self.plan) if code == 200 else assist.fail_text("실행", code, data)
+        self.stop()
+        await interaction.edit_original_response(content=text, view=None)
+
+    @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._close(interaction, "취소했어요.")
+
+    async def on_timeout(self):
+        if self.done or self.message is None:
+            return
+        try:
+            await self.message.edit(content="2분이 지나 취소됐어요. 다시 말해 주세요.", view=None)
+        except Exception:
+            pass
+
+
+async def handle_assist(message: discord.Message):
+    mentioned = client.user is not None and client.user in message.mentions
+    text = assist.strip_mention(message.content, client.user.id if client.user else "")
+    if not assist.should_handle(text):
+        return
+    if user_tier(message.author) < TIER_ORDER["부원"]:
+        if mentioned:
+            await message.reply("부원 이상만 쓸 수 있어요.", mention_author=False)
+        return
+    requester = assist.requester_of(message.author.id, message.author.display_name,
+                                    [r.name for r in getattr(message.author, "roles", [])])
+    code, plan = await asyncio.to_thread(assist.plan, API, text, requester, API_HEADERS)
+    if code != 200:
+        # 잡담까지 서버 오류로 답하지 않게 — 봇을 불렀을 때만 알린다
+        if mentioned:
+            await message.reply(assist.fail_text("요청 해석", code, plan), mention_author=False)
+        return
+    if not plan.get("actions"):
+        if mentioned or not assist.is_quiet(plan):
+            await message.reply(assist.format_not_understood(plan), mention_author=False)
+        return
+    if not plan.get("needsConfirm"):
+        async with message.channel.typing():
+            code, res = await asyncio.to_thread(assist.execute, API, plan["planId"], requester, API_HEADERS)
+        text = assist.format_results(res, plan) if code == 200 else assist.fail_text("실행", code, res)
+        await message.reply(text, mention_author=False)
+        return
+    view = AssistConfirmView(plan, requester)
+    view.message = await message.reply(assist.format_plan(plan), view=view, mention_author=False)
+
+
 @client.event
 async def on_message(message: discord.Message):
-    if message.author.bot or not GROQ_API_KEY:
+    if message.author.bot:
         return
-    if not in_home_guild(message.guild) or getattr(message.channel, "name", None) != CHATOPS_CHANNEL:
+    channel_name = getattr(message.channel, "name", None)
+    if ASSIST_ENABLED and in_home_guild(message.guild) and channel_name in ASSIST_CHANNELS:
+        try:
+            await handle_assist(message)
+        except Exception as e:
+            log.warning(f"말로 조작 오류: {e}")
+        return
+    if not GROQ_API_KEY:
+        return
+    if not in_home_guild(message.guild) or channel_name != CHATOPS_CHANNEL:
         return
     content = (message.content or "").strip()
     image_atts = [a for a in message.attachments
@@ -1146,6 +1247,8 @@ async def on_ready():
         tree.copy_global_to(guild=discord.Object(id=guild.id))
         await tree.sync(guild=discord.Object(id=guild.id))
         log.info(f"슬래시 명령 동기화 완료 (guild={guild.name})")
+    if ASSIST_ENABLED:
+        log.info(f"말로 조작 활성화 (#{', #'.join(sorted(ASSIST_CHANNELS))} → {API}/assist)")
     if GROQ_API_KEY:
         log.info(f"ChatOps 활성화 (#{CHATOPS_CHANNEL}, 모델={GROQ_MODEL})")
     else:
